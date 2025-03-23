@@ -51,14 +51,8 @@ class InvariantTrainer(transformers.Trainer):
                 "eps": self.args.adam_epsilon,
             }
         optimizer_kwargs["lr"] = self.args.learning_rate
-        if self.sharded_dpp:
-            optimizer = OSS(
-                params=optimizer_grouped_parameters,
-                optim=optimizer_cls,
-                **optimizer_kwargs,
-            )
-        else:
-            optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        
+        optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         lr_scheduler = get_scheduler(
             self.args.lr_scheduler_type,

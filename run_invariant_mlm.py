@@ -222,6 +222,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     nb_steps = data_args.nb_steps
+    training_args.local_rank = -1  # Force explicitement le local_rank à -1 (pas de distributed)
 
     # Detecting last checkpoint.
     last_checkpoint = None
