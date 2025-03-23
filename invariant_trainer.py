@@ -132,12 +132,7 @@ class InvariantTrainer(transformers.Trainer):
         optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.encoder, num_training_steps=max_steps)
 
         self.state = TrainerState()
-
-        if self.args.n_gpu > 0:
-            self.model.to('cuda')
-
-        if self.args.n_gpu > 1:
-            self.model = torch.nn.DataParallel(self.model)
+        self.model.to(self.args.device)
 
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         num_examples = total_train_batch_size * max_steps
@@ -180,11 +175,7 @@ class InvariantTrainer(transformers.Trainer):
                     loss = self.training_step(self.model, inputs)
 
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        if self.use_amp:
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(optimizer)
-                            self.scaler.unscale_(optimizers[env_name])
-
+                        
                         if hasattr(optimizer, "clip_grad_norm"):
                             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
                             optimizer.clip_grad_norm(self.args.max_grad_norm)
@@ -196,13 +187,9 @@ class InvariantTrainer(transformers.Trainer):
                                 self.args.max_grad_norm,
                             )
 
-                    if self.use_amp:
-                        self.scaler.step(optimizer)
-                        self.scaler.step(optimizers[env_name])
-                        self.scaler.update()
-                    else:
-                        optimizer.step()
-                        optimizers[env_name].step()
+                    
+                    optimizer.step()
+                    optimizers[env_name].step()
 
                     lr_scheduler.step()
                     lr_schedulers[env_name].step()
@@ -275,12 +262,8 @@ class InvariantTrainer(transformers.Trainer):
 
         self.state = TrainerState()
 
-        if self.args.n_gpu > 0:
-            self.model.to('cuda')
-
-        if self.args.n_gpu > 1:
-            self.model = torch.nn.DataParallel(self.model)
-
+        self.model.to(self.args.device)
+        
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         num_examples = total_train_batch_size * max_steps
 
@@ -324,18 +307,12 @@ class InvariantTrainer(transformers.Trainer):
 
                     batch = next(iter_loaders[env_name])
                     # uncomment it, for CPU only run
-                    if self.args.n_gpu > 0:
-                        batch = batch.to('cuda')
+                    batch.to(self.args.device)
 
                     # loss.backward() is done inside training step
                     loss = self.training_step(self.model, batch)
 
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        if self.use_amp:
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(optimizer)
-                            for env_name in training_set.keys():
-                                self.scaler.unscale_(optimizers[env_name])
 
                         if hasattr(optimizer, "clip_grad_norm"):
                             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
@@ -349,15 +326,10 @@ class InvariantTrainer(transformers.Trainer):
                                 self.args.max_grad_norm,
                             )
 
-                    if self.use_amp:
-                        self.scaler.step(optimizer)
-                        for e_n in training_set.keys():
-                            self.scaler.step(optimizers[e_n])
-                        self.scaler.update()
-                    else:
-                        optimizer.step()
-                        for e_n in training_set.keys():
-                            optimizers[e_n].step()
+                   
+                    optimizer.step()
+                    for e_n in training_set.keys():
+                        optimizers[e_n].step()
 
                     lr_scheduler.step()
                     for e_n in training_set.keys():
@@ -390,9 +362,7 @@ class InvariantTrainer(transformers.Trainer):
         """
         if train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
-        # if is_tpu_available():
-        #     train_sampler = get_tpu_sampler(train_dataset)
-        # else:
+        
         train_sampler = (
             RandomSampler(train_dataset)
             if self.args.local_rank == -1
