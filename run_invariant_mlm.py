@@ -194,6 +194,15 @@ class DataTrainingArguments:
         metadata={"help": "Number of training steps."},
     )
 
+    training_categories: Optional[str] = field(
+        default=None,
+        metadata={"help": "Liste des catégories pour l'entraînement (InD), séparées par des virgules, ex : 'rec.sport.baseball,sci.med'"}
+    )
+    ood_categories: Optional[str] = field(
+        default=None,
+        metadata={"help": "Liste des catégories OoD, séparées par des virgules, ex : 'comp.graphics,talk.politics.guns'"}
+    )
+
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
@@ -285,14 +294,56 @@ def main():
                 irm_datasets[env_name] = datasets
 
     elif data_args.dataset_name is not None:
-        # Charger le dataset directement depuis Hugging Face
-        train_dataset = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split="train",
-            # streaming=True  # Optionnel : utile si le dataset est très volumineux
-        )
-        irm_datasets = {"train": train_dataset}
+        # Charger le split train complet
+            full_train_dataset = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split="train",
+            )
+            # Charger le split test complet pour l'évaluation
+            full_test_dataset = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split="test",
+            )
+            
+            # Si les catégories ont été spécifiées, on filtre
+            if data_args.training_categories and data_args.ood_categories:
+                train_cats = [cat.strip() for cat in data_args.training_categories.split(",")]
+                ood_cats = [cat.strip() for cat in data_args.ood_categories.split(",")]
+                
+                inD_train = full_train_dataset.filter(lambda x: x["label_text"] in train_cats)
+                # Pour évaluer InD, on peut prélever une partie du split test correspondant aux mêmes catégories
+                inD_val = full_test_dataset.filter(lambda x: x["label_text"] in train_cats)
+                ood_val = full_test_dataset.filter(lambda x: x["label_text"] in ood_cats)
+                
+                # Pour l'entraînement, selon votre architecture :
+                # • Pour eLM, vous souhaitez une seule tête : alors vous fusionnez (ou utilisez inD_train tel quel)
+                # • Pour iLM/ensLM, vous souhaitez plusieurs environnements, chacun correspondant à une catégorie
+                # Ici, nous affecterons les données d'entraînement de façon différente selon le mode.
+                
+                # Par exemple, pour iLM/ensLM, on crée un dictionnaire avec une entrée par environnement
+                env_train_datasets = {}
+                for cat in train_cats:
+                    env_train_datasets[cat] = full_train_dataset.filter(lambda x: x["label_text"] == cat)
+                
+                # Choix de mode (eLM ou invariance) basé sur un flag en arguments, par exemple data_args.ensembling.
+                # Si vous ne voulez qu'eLM, vous utiliserez inD_train (fusionné) avec un unique environnement.
+                if not model_args.ensembling:
+                    # Mode eLM
+                    irm_datasets = {"train": inD_train}
+                    # Pour la configuration du modèle, ne définir aucun environnement, de façon à ce que le code
+                    # fasse automatiquement : if len(config.envs)==0 then self.envs = ['erm'].
+                else:
+                    # Mode iLM/ensLM avec plusieurs environnements
+                    irm_datasets = env_train_datasets
+                
+                # On place les ensembles de validation dans le dictionnaire sous des clés spécifiques
+                irm_datasets["val_ind"] = inD_val
+                irm_datasets["val_ood"] = ood_val
+            else:
+                # Si pas de catégories spécifiées, on garde le dataset complet
+                irm_datasets = {"train": full_train_dataset, "val": full_test_dataset}
 
     else:
         raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
@@ -319,6 +370,17 @@ def main():
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
+
+    # Pour différencier les modes d'entraînement :
+    # - Pour iLM/ensLM, on souhaite fournir plusieurs environnements. On suppose que l'argument data_args.training_categories
+    #   contient une chaîne de caractères avec les catégories séparées par des virgules.
+    # - Pour eLM, on souhaite n'avoir qu'un seul environnement, par exemple "erm".
+    if model_args.ensembling:
+        # On récupère la liste des catégories d'entraînement
+        train_cats = [cat.strip() for cat in data_args.training_categories.split(",")]
+        config.envs = train_cats
+    else:
+        config.envs = ["erm"]
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -516,7 +578,14 @@ def main():
                                                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                nb_steps_model_saving=model_args.nb_steps_model_saving,
                                                resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        # trainer.save_model()  # Saves the tokenizer too for easy upload
+        output_dir = training_args.output_dir  # ou le chemin de sortie que tu utilises
+
+        # Sauvegarde du modèle avec safe_serialization désactivé
+        trainer.model.save_pretrained(output_dir, safe_serialization=False)
+        # Sauvegarde du tokenizer
+        trainer.tokenizer.save_pretrained(output_dir)
+
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():
@@ -538,12 +607,22 @@ def main():
     # Evaluation
     results = {}
     if training_args.do_eval:
-        logger.info("*** Evaluate ***")
+        results = {}
+        if "val_ind" in irm_datasets:
+            logger.info("*** Evaluate InD ***")
+            # Dans le cas où le dataset a été chargé via load_dataset("text",...) il faut récupérer la clé "validation"
+            # mais ici full_test_dataset.filter retourne un Dataset (pas un dict), donc on peut le passer directement.
+            eval_output_ind = trainer.evaluate(eval_dataset=irm_datasets["val_ind"])
+            perplexity_ind = math.exp(eval_output_ind["eval_loss"])
+            results["perplexity_ind"] = perplexity_ind
+            logger.info(f"InD perplexity = {perplexity_ind}")
+        if "val_ood" in irm_datasets:
+            logger.info("*** Evaluate OoD ***")
+            eval_output_ood = trainer.evaluate(eval_dataset=irm_datasets["val_ood"])
+            perplexity_ood = math.exp(eval_output_ood["eval_loss"])
+            results["perplexity_ood"] = perplexity_ood
+            logger.info(f"OoD perplexity = {perplexity_ood}")
 
-        eval_output = trainer.evaluate()
-
-        perplexity = math.exp(eval_output["eval_loss"])
-        results["perplexity"] = perplexity
         output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
         if trainer.is_world_process_zero():
             with open(output_eval_file, "w") as writer:
@@ -556,12 +635,6 @@ def main():
         # trainer.save_metrics("eval", results)
 
     return results
-
-
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
-
 
 if __name__ == "__main__":
     main()
