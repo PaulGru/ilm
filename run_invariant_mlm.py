@@ -271,15 +271,30 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    irm_folder = data_args.train_file
-    irm_datasets = {}
-    for file in os.listdir(irm_folder):
-        if file.endswith('.txt'):
-            env_name = file.split(".")[0]
-            data_files = {}
-            data_files["train"] = os.path.join(irm_folder, file)
-            datasets = load_dataset("text", data_files=data_files)
-            irm_datasets[env_name] = datasets
+    
+    if data_args.train_file is not None:
+        irm_folder = data_args.train_file
+        irm_datasets = {}
+        for file in os.listdir(irm_folder):
+            if file.endswith('.txt'):
+                env_name = file.split(".")[0]
+                data_files = {}
+                data_files["train"] = os.path.join(irm_folder, file)
+                datasets = load_dataset("text", data_files=data_files)
+                irm_datasets[env_name] = datasets
+
+    elif data_args.dataset_name is not None:
+        # Charger le dataset directement depuis Hugging Face
+        train_dataset = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split="train",
+            # streaming=True  # Optionnel : utile si le dataset est très volumineux
+        )
+        irm_datasets = {"train": train_dataset}
+
+    else:
+        raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
     if data_args.validation_file is not None:
         data_files = {}
@@ -365,10 +380,15 @@ def main():
     irm_tokenized_datasets = {}
     for env_name, datasets in irm_datasets.items():
         if training_args.do_train and 'validation' not in env_name:
-            column_names = datasets["train"].column_names
+
+            if isinstance(datasets, dict):
+                column_names = datasets["train"].column_names
+            else:
+                column_names = datasets.column_names
+
         elif training_args.do_eval and 'validation' in env_name:
             column_names = datasets["validation"].column_names
-        text_column_name = "text" if "text" in column_names else column_names[0]
+        text_column_name = "content" if "content" in column_names else column_names[0]
 
         if data_args.max_seq_length is None:
             max_seq_length = tokenizer.model_max_length
