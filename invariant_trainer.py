@@ -72,7 +72,6 @@ class InvariantTrainer(transformers.Trainer):
             training_set,
             nb_steps: Optional[int] = None,
             nb_steps_heads_saving: Optional[int] = 0,
-            resume_from_checkpoint: Optional[str] = None,
             num_train_epochs: Optional[int] = 1,
             nb_steps_model_saving: Optional[int] = 0,
             **kwargs,
@@ -81,21 +80,11 @@ class InvariantTrainer(transformers.Trainer):
         Main training entry point.
 
         Args:
-            resume_from_checkpoint (:obj:`str`, `optional`):
-                Local path to a saved checkpoint as saved by a previous instance of :class:`~transformers.Trainer`. If
-                present, training will resume from the model/optimizer/scheduler states loaded here.
             trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
                 The trial run or the hyperparameter dictionary for hyperparameter search.
             kwargs:
                 Additional keyword arguments used to hide deprecated arguments
         """
-        if "model_path" in kwargs:
-            resume_from_checkpoint = kwargs.pop("model_path")
-            warnings.warn(
-                "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
-                "instead.",
-                FutureWarning,
-            )
 
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
@@ -201,7 +190,6 @@ class InvariantTrainer(transformers.Trainer):
             training_set,
             nb_steps: Optional[int] = None,
             nb_steps_heads_saving: Optional[int] = 0,
-            resume_from_checkpoint: Optional[str] = None,
             num_train_epochs: Optional[int] = 1,
             nb_steps_model_saving: Optional[int] = 0,
             **kwargs,
@@ -210,21 +198,14 @@ class InvariantTrainer(transformers.Trainer):
         Training the heads as en ensemble instead of following the IRM-games dynamic
 
         Args:
-            resume_from_checkpoint (:obj:`str`, `optional`):
-                Local path to a saved checkpoint as saved by a previous instance of :class:`~transformers.Trainer`. If
-                present, training will resume from the model/optimizer/scheduler states loaded here.
+            nb_steps : permet de contrôler directement le nombre de optimizer.step() qui sont réalisés.
+            num_train_epochs : nombre d'epochs d'entraînement à faire.
             trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
                 The trial run or the hyperparameter dictionary for hyperparameter search.
             kwargs:
                 Additional keyword arguments used to hide deprecated arguments
         """
-        if "model_path" in kwargs:
-            resume_from_checkpoint = kwargs.pop("model_path")
-            warnings.warn(
-                "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
-                "instead.",
-                FutureWarning,
-            )
+       
 
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
@@ -234,14 +215,16 @@ class InvariantTrainer(transformers.Trainer):
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
 
+        # le nombre d'updates (steps) effectués durant une epoch.
+        num_update_steps_per_epoch = math.floor(
+                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
+
         if nb_steps is not None:
             max_steps = nb_steps
-            num_update_steps_per_epoch = math.floor(
-                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
             num_train_epochs = max(1, math.floor(max_steps / num_update_steps_per_epoch))
+        
+        # Si on ne spécifie pas nb_steps, alors num_train_epochs détermine combien de fois on parcourt les données.
         else:
-            num_update_steps_per_epoch = math.floor(
-                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
             max_steps = num_update_steps_per_epoch * num_train_epochs
 
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
@@ -259,7 +242,7 @@ class InvariantTrainer(transformers.Trainer):
         self.model.to(self.args.device)
         
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
-        num_examples = total_train_batch_size * max_steps
+        num_examples = total_train_batch_size * max_steps # nombre total d'exemples vu durant l'entraînement.
 
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples}")

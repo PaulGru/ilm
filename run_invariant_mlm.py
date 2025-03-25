@@ -337,6 +337,7 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    
 
     if model_args.model_name_or_path:
         model = AutoModelForMaskedLM.from_pretrained(
@@ -381,7 +382,14 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     irm_tokenized_datasets = {}
+
+
+
     for env_name, datasets in irm_datasets.items():
+        # En mode évaluation seule, ne traiter que l'environnement de validation
+        if not training_args.do_train and "validation" not in env_name:
+            continue
+
         if training_args.do_train and 'validation' not in env_name:
 
             if isinstance(datasets, dict):
@@ -392,6 +400,9 @@ def main():
         elif training_args.do_eval and 'validation' in env_name:
             column_names = datasets["validation"].column_names
         text_column_name = "content" if "content" in column_names else column_names[0]
+
+
+
 
         if data_args.max_seq_length is None:
             max_seq_length = tokenizer.model_max_length
@@ -511,15 +522,19 @@ def main():
                                                    nb_steps=nb_steps,
                                                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
-                                                   resume_from_checkpoint=checkpoint)
+                                                   )
         else:
             train_result = trainer.invariant_train(training_set=train_tokenized_datasets,
-                                               nb_steps=nb_steps,
-                                               nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                                               nb_steps_model_saving=model_args.nb_steps_model_saving,
-                                               resume_from_checkpoint=checkpoint)
+                                                    nb_steps=nb_steps,
+                                                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                    )
         
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        # trainer.save_model()  # Saves the tokenizer too for easy upload
+        output_dir = training_args.output_dir  # ou votre répertoire de sortie
+        trainer.model.save_pretrained(output_dir, safe_serialization=False)
+        trainer.tokenizer.save_pretrained(output_dir)
+
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():
