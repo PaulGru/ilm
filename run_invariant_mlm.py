@@ -20,6 +20,7 @@ https://huggingface.co/models?filter=masked-lm
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
+import pandas as pd
 import logging
 import math
 import os
@@ -52,7 +53,6 @@ from transformers import (
     RobertaTokenizer,
     RobertaTokenizerFast
 )
-from transformers.trainer_utils import get_last_checkpoint, is_main_process
 
 
 logger = logging.getLogger(__name__)
@@ -85,9 +85,6 @@ class ModelArguments:
         default=None,
         metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
     tokenizer_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
@@ -102,13 +99,6 @@ class ModelArguments:
     model_revision: str = field(
         default="main",
         metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
     )
     init_head: Optional[bool] = field(
         default=False,
@@ -178,10 +168,6 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
-    line_by_line: bool = field(
-        default=False,
-        metadata={"help": "Whether distinct lines of text in the dataset are to be handled as distinct sequences."},
-    )
     pad_to_max_length: bool = field(
         default=False,
         metadata={
@@ -222,22 +208,8 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     nb_steps = data_args.nb_steps
-    training_args.local_rank = -1  # Force explicitement le local_rank à -1 (pas de distributed)
-
-    # Detecting last checkpoint.
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
+    training_args.local_rank = -1
+    set_seed(training_args.seed)
 
     # Setup logging
     logging.basicConfig(
@@ -245,34 +217,15 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
-
-    # Log on each process the small summary:
+    logger.setLevel(logging.INFO)
     logger.info(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
-
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column. You can easily tweak this
-    # behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    
+    # Soit on fournit des fichiers txt (chacun représente un environnement)
     if data_args.train_file is not None:
         irm_folder = data_args.train_file
         irm_datasets = {}
@@ -284,9 +237,8 @@ def main():
                 datasets = load_dataset("text", data_files=data_files)
                 irm_datasets[env_name] = datasets
 
+    # Soit on fournit un dataset Hugging Face
     elif data_args.dataset_name is not None:
-            
-        # Charger le dataset directement depuis Hugging Face
         train_dataset = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
@@ -305,72 +257,42 @@ def main():
         eval_datasets = load_dataset("text", data_files=data_files)
         irm_datasets['validation-file'] = eval_datasets
 
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    config_kwargs = {
-        "cache_dir": model_args.cache_dir,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
-    }
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-
-    tokenizer_kwargs = {
-        "cache_dir": model_args.cache_dir,
-        "use_fast": model_args.use_fast_tokenizer,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
-    }
-    if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
-    elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
     
 
-    if model_args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config)
+    # Load model and tokenizer
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=None,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        use_auth_token=None,
+    )
+
+    model = AutoModelForMaskedLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=None,
+    )
 
     envs = [k for k in irm_datasets.keys() if 'validation' not in k]
 
-    def is_jsonable(x):
-        import json
-        try:
-            json.dumps(x)
-            return True
-        except:
-            return False
-
-    if 'envs' not in config.to_dict(): #if we didn't already load from pretrained an irm model
-        if 'distil' in model_args.model_name_or_path:
-            inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
-            irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
-        else:
-            inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
-            irm_model = InvariantRobertaForMaskedLM(inv_config, model)
+    
+    if 'distil' in model_args.model_name_or_path:
+        inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
+        irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
     else:
-        irm_model = model
+        inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
+        irm_model = InvariantRobertaForMaskedLM(inv_config, model)
+
 
     irm_model.resize_token_embeddings(len(tokenizer))
 
@@ -382,7 +304,6 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     irm_tokenized_datasets = {}
-
 
 
     for env_name, datasets in irm_datasets.items():
@@ -402,8 +323,6 @@ def main():
         text_column_name = "content" if "content" in column_names else column_names[0]
 
 
-
-
         if data_args.max_seq_length is None:
             max_seq_length = tokenizer.model_max_length
             if max_seq_length > 1024:
@@ -420,77 +339,49 @@ def main():
                 )
             max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-        if data_args.line_by_line:
-            # When using line_by_line, we just tokenize each nonempty line.
-            padding = "max_length" if data_args.pad_to_max_length else False
+        
+        # We tokenize every text, then concatenate them together before splitting them in smaller parts.
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
 
-            def tokenize_function(examples):
-                # Remove empty lines
-                examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
-                return tokenizer(
-                    examples["text"],
-                    padding=padding,
-                    truncation=True,
-                    max_length=max_seq_length,
-                    # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                    # receives the `special_tokens_mask`.
-                    return_special_tokens_mask=True,
-                )
+        # map() applique la tokenisation à chaque exemple.
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True, # traite les exemples par batch
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names, # on supprime les colonnes une fois la tokenisation réalisée
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
-            tokenized_datasets = datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=[text_column_name],
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
-            irm_tokenized_datasets[env_name] = tokenized_datasets
-        else:
-            # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
-            # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
-            # efficient when it receives the `special_tokens_mask`.
-            def tokenize_function(examples):
-                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+        # Main data processing function that will concatenate all texts from our dataset and generate chunks of
+        # max_seq_length.
+        def group_texts(examples):
+            
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()} # Concatenate all texts.
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            
+            # Pas de padding, on supprimer les tokens restant qui n'atteignent pas la taille max_seq_length
+            total_length = (total_length // max_seq_length) * max_seq_length
+            
+            # Split by chunks of max_len.
+            result = {
+                k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+                for k, t in concatenated_examples.items()
+            }
+            return result
 
-            tokenized_datasets = datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
+        # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
+        # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
+        # might be slower to preprocess.
+        tokenized_datasets = tokenized_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+        irm_tokenized_datasets[env_name] = tokenized_datasets
 
-            # Main data processing function that will concatenate all texts from our dataset and generate chunks of
-            # max_seq_length.
-            def group_texts(examples):
-                # Concatenate all texts.
-                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-                total_length = len(concatenated_examples[list(examples.keys())[0]])
-                # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-                # customize this part to your needs.
-                total_length = (total_length // max_seq_length) * max_seq_length
-                # Split by chunks of max_len.
-                result = {
-                    k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                    for k, t in concatenated_examples.items()
-                }
-                return result
-
-            # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-            # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-            # might be slower to preprocess.
-            #
-            # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-            # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-            tokenized_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
-            irm_tokenized_datasets[env_name] = tokenized_datasets
-
-    # Data collator
+    
     # This one will take care of randomly masking the tokens.
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
 
@@ -501,20 +392,38 @@ def main():
     trainer = InvariantTrainer(
         model=irm_model,
         args=training_args,
-        # train_dataset=tokenized_datasets["train"] if training_args.do_train else None,
         eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
 
+    training_logs = []
+    eval_logs = []
+
     # Training
     if training_args.do_train:
-        if last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
-        else:
-            checkpoint = None
+
+        def log_training_step(training_logs, step, loss):
+            log_entry = {
+                "step": step,
+                "loss": loss,
+                "perplexity": math.exp(loss) if loss is not None else float("inf")
+            }
+            training_logs.append(log_entry)
+
+        def log_eval_step(eval_logs, step, eval_output):
+            eval_loss = eval_output.get("eval_loss")
+            log_entry = {
+                "step": step,
+                "eval_loss": eval_loss,
+                "eval_perplexity": math.exp(eval_loss) if eval_loss is not None else float("inf")
+            }
+            eval_logs.append(log_entry)
+
+        def eval_fn():
+            eval_output = trainer.evaluate()
+            log_eval_step(eval_logs, trainer.state.global_step, eval_output)
+            return eval_output
 
         if model_args.ensembling:
             logger.info("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
@@ -522,27 +431,43 @@ def main():
                                                    nb_steps=nb_steps,
                                                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                   training_logs=training_logs,
+                                                   eval_logs=eval_logs,
+                                                   eval_fn=eval_fn,
+                                                   log_training_step=log_training_step
                                                    )
         else:
+            logger.info("TRAINING WITH INVARIANT -- FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.invariant_train(training_set=train_tokenized_datasets,
                                                     nb_steps=nb_steps,
                                                     nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                     nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                    training_logs=training_logs,
+                                                    eval_logs=eval_logs,
+                                                    eval_fn=eval_fn,
+                                                    log_training_step=log_training_step
                                                     )
         
-        # trainer.save_model()  # Saves the tokenizer too for easy upload
-        output_dir = training_args.output_dir  # ou votre répertoire de sortie
+        # sauvegarde du modèle
+        output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
         trainer.tokenizer.save_pretrained(output_dir)
 
+        # sauvegarde des courbes d'entraînement
+        df_train = pd.Dataframe(training_logs)
+        df_train.to_csv(os.path.join(output_dir, "train_curve.csv"), index=False)
+
+         # sauvegarde des courbes d'évalaution
+        df_eval = pd.Dataframe(eval_logs)
+        df_eval.to_csv(os.path.join(output_dir, "eval_curve.csv"), index=False)
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():
             with open(output_train_file, "w") as writer:
                 logger.info("***** Train results *****")
-#                for key, value in sorted(train_result.metrics.items()):
-#                    logger.info(f"  {key} = {value}")
-#                    writer.write(f"{key} = {value}\n")
+                for key, value in sorted(train_result.metrics.items()):
+                    logger.info(f"  {key} = {value}")
+                    writer.write(f"{key} = {value}\n")
 
             # Need to save the state, since Trainer.save_model saves only the tokenizer with the model
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
@@ -556,11 +481,13 @@ def main():
     # Evaluation
     results = {}
     if training_args.do_eval:
+       
         logger.info("*** Evaluate ***")
 
-        eval_output = trainer.evaluate()
+        results = trainer.evaluate()
 
-        perplexity = math.exp(eval_output["eval_loss"])
+        eval_loss = results.get("eval_loss")
+        perplexity = math.exp(eval_loss) if eval_loss is not None else float("inf")
         results["perplexity"] = perplexity
 
         output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
@@ -569,12 +496,13 @@ def main():
                 logger.info("***** Eval results *****")
                 for key, value in sorted(results.items()):
                     logger.info(f"  {key} = {value}")
-#                    writer.write(f"{key} = {value}\n")
-
-        # trainer.log_metrics("eval", results)
-        # trainer.save_metrics("eval", results)
+                    writer.write(f"{key} = {value}\n")
+        
+        trainer.log_metrics("eval", results)
+        trainer.save_metrics("eval", results)
 
     return results
+
 
 if __name__ == "__main__":
     main()

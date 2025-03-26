@@ -74,6 +74,10 @@ class InvariantTrainer(transformers.Trainer):
             nb_steps_heads_saving: Optional[int] = 0,
             num_train_epochs: Optional[int] = 1,
             nb_steps_model_saving: Optional[int] = 0,
+            training_logs=None,
+            eval_logs=None,
+            eval_fn=None,
+            log_training_step=None,
             **kwargs,
     ):
         """
@@ -169,7 +173,6 @@ class InvariantTrainer(transformers.Trainer):
                                 self.model.parameters(),
                                 self.args.max_grad_norm,
                             )
-
                     
                     optimizer.step()
                     optimizers[env_name].step()
@@ -178,6 +181,15 @@ class InvariantTrainer(transformers.Trainer):
                     lr_schedulers[env_name].step()
 
                     total_trained_steps += 1
+
+                    if log_training_step is not None:
+                        log_training_step(training_logs, total_trained_steps, loss.item())
+                    
+                    if eval_fn is not None and total_trained_steps % 100 == 0:
+                        eval_metrics = eval_fn()
+                        if eval_logs is not None and eval_metrics is not None:
+                            eval_logs.append((total_trained_steps, eval_metrics))
+
                     if saving_heads:
                         if total_trained_steps % nb_steps_heads_saving == 0:
                             self.save_heads(total_trained_steps)
@@ -192,6 +204,10 @@ class InvariantTrainer(transformers.Trainer):
             nb_steps_heads_saving: Optional[int] = 0,
             num_train_epochs: Optional[int] = 1,
             nb_steps_model_saving: Optional[int] = 0,
+            training_logs=None,
+            eval_logs=None,
+            eval_fn=None,
+            log_training_step=None,
             **kwargs,
     ):
         """
@@ -313,6 +329,15 @@ class InvariantTrainer(transformers.Trainer):
                         lr_schedulers[e_n].step()
 
                     total_trained_steps += 1
+
+                    if log_training_step is not None:
+                        log_training_step(training_logs, total_trained_steps, loss.item())
+                    
+                    if eval_fn is not None and total_trained_steps % 100 == 0:
+                        eval_metrics = eval_fn()
+                        if eval_logs is not None and eval_metrics is not None:
+                            eval_logs.append((total_trained_steps, eval_metrics))
+
                     if saving_heads:
                         if total_trained_steps % nb_steps_heads_saving == 0:
                             self.save_heads(total_trained_steps)
@@ -330,8 +355,18 @@ class InvariantTrainer(transformers.Trainer):
             os.makedirs("lm_heads")
 
         for env, lm_head in self.model.lm_heads.items():
+            if hasattr(lm_head, "dense"):
+                # Cas RoBERTa
+                weights = lm_head.dense.weight.data.cpu().numpy()
+            elif hasattr(lm_head, "vocab_transform"):
+                # Cas DistilBERT
+                weights = lm_head.vocab_transform.weight.data.cpu().numpy()
+            else:
+                raise AttributeError("Inconnu : impossible d'extraire les poids de la tête")
+
             filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
-            np.save(filepath, lm_head.dense.weight.data.cpu().numpy())
+            np.save(filepath, weights)
+
 
     def get_single_train_dataloader(self, env_name, train_dataset):
         """
@@ -352,3 +387,6 @@ class InvariantTrainer(transformers.Trainer):
             sampler=train_sampler,
             collate_fn=self.data_collator
         )
+    
+
+     
