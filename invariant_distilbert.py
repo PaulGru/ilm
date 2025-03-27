@@ -85,7 +85,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
 
     def init_head(self):
         for env_name in self.envs:
-            self.lm_heads[env_name] = DistilBertLMHead(config)
+            self.lm_heads[env_name] = DistilBertLMHead(self.config)
             self.lm_heads[env_name].to('cuda')
 
     def init_base(self):
