@@ -484,7 +484,7 @@ def main():
        
         logger.info("*** Evaluate ***")
 
-        results = trainer.evaluate()
+        results = trainer.evaluate() # retourne la moyenne de la cross-entropy sur les tokens masqués.
 
         eval_loss = results.get("eval_loss")
         perplexity = math.exp(eval_loss) if eval_loss is not None else float("inf")

@@ -4,7 +4,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 
 import transformers
-from transformers.optimization import Adafactor, AdamW, get_scheduler
+from transformers.optimization import Adafactor, get_scheduler
+from torch.optim import AdamW
 from transformers.trainer_callback import TrainerState
 from transformers.utils import logging
 
@@ -162,14 +163,8 @@ class InvariantTrainer(transformers.Trainer):
                     loss = self.training_step(self.model, inputs)
 
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        
-                        if hasattr(optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            optimizer.clip_grad_norm(self.args.max_grad_norm)
-                            optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            torch.nn.utils.clip_grad_norm_(
+                       
+                       torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters(),
                                 self.args.max_grad_norm,
                             )
@@ -196,6 +191,7 @@ class InvariantTrainer(transformers.Trainer):
                     if saving_intermediary_models:
                         if total_trained_steps % nb_steps_model_saving == 0:
                             self.save_intermediary_model(total_trained_steps)
+
 
     def ensemble_train(
             self,
@@ -307,17 +303,10 @@ class InvariantTrainer(transformers.Trainer):
 
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
 
-                        if hasattr(optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            optimizer.clip_grad_norm(self.args.max_grad_norm)
-                            for e_n in training_set.keys():
-                                optimizers[e_n].clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.args.max_grad_norm,
-                            )
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.args.max_grad_norm,
+                        )
 
                    
                     optimizer.step()
@@ -345,6 +334,146 @@ class InvariantTrainer(transformers.Trainer):
                         if total_trained_steps % nb_steps_model_saving == 0:
                             self.save_intermediary_model(total_trained_steps)
 
+
+
+    def multitask_train(
+            self,
+            training_set,
+            nb_steps: Optional[int] = None,
+            nb_steps_heads_saving: Optional[int] = 0,
+            num_train_epochs: Optional[int] = 1,
+            nb_steps_model_saving: Optional[int] = 0,
+            training_logs=None,
+            eval_logs=None,
+            eval_fn=None,
+            log_training_step=None,
+            **kwargs,
+    ):
+
+        if nb_steps is None and num_train_epochs is None:
+            raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
+
+        if len(kwargs) > 0:
+            raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
+
+        min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
+
+        if nb_steps is not None:
+            max_steps = nb_steps
+            num_update_steps_per_epoch = math.floor(
+                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
+            num_train_epochs = max(1, math.floor(max_steps / num_update_steps_per_epoch))
+        else:
+            num_update_steps_per_epoch = math.floor(
+                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
+            max_steps = num_update_steps_per_epoch * num_train_epochs
+
+        dataloaders, optimizers, lr_schedulers = {}, {}, {}
+        for env_name, data_features in training_set.items():
+            dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
+            optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.lm_heads[env_name],
+                                                                          num_training_steps=max_steps)
+            optimizers[env_name] = optimizer
+            lr_schedulers[env_name] = lr_scheduler
+
+        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.encoder, num_training_steps=max_steps)
+
+        self.state = TrainerState()
+        self.model.to(self.args.device)
+
+        total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
+        num_examples = total_train_batch_size * max_steps
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {num_examples}")
+        logger.info(f"  Num Epochs = {num_train_epochs}")
+        logger.info(f"  num_update_steps_per_epoch = {num_update_steps_per_epoch}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {max_steps}")
+
+        saving_heads = bool(nb_steps_heads_saving > 0)
+        saving_intermediary_models = bool(nb_steps_model_saving > 0)
+        total_trained_steps = 0
+
+        for epoch in range(num_train_epochs):
+            logger.info(f" Epoch: {epoch}")
+
+            # make all dataloader iterateable
+            iter_loaders = {}
+            for env_name in training_set.keys():
+                train_loader = dataloaders[env_name]
+                iter_loaders[env_name] = iter(train_loader)
+
+            for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
+                if total_trained_steps >= max_steps:
+                    break
+
+                for env_name in training_set.keys():
+                    logger.info(f" Update on environement {env_name}")
+                    # get a batch
+                    optimizer.zero_grad()
+                    optimizers[env_name].zero_grad()
+
+                    inputs = next(iter_loaders[env_name])
+                    inputs = {k: v.to(self.args.device) for k, v in inputs.items()}
+
+                    # make an update
+                    loss = self.training_step(self.model, inputs)
+
+                    # Encoder forward
+                    outputs = self.model.encoder(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                    )
+                    hidden_states = outputs[0]
+
+                    # Head forward
+                    logits = self.model.lm_heads[env_name](hidden_states)
+
+                    # Compute loss (masked LM loss)
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = inputs["labels"][..., 1:].contiguous()
+                    loss_fct = torch.nn.CrossEntropyLoss()
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
+
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                       torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.args.max_grad_norm,
+                            )
+                    
+                    optimizer.step()
+                    optimizers[env_name].step()
+
+                    lr_scheduler.step()
+                    lr_schedulers[env_name].step()
+
+                    total_trained_steps += 1
+
+                    if log_training_step is not None:
+                        log_training_step(training_logs, total_trained_steps, loss.item())
+                    
+                    if eval_fn is not None and total_trained_steps % 100 == 0:
+                        eval_metrics = eval_fn()
+                        if eval_logs is not None and eval_metrics is not None:
+                            eval_logs.append((total_trained_steps, eval_metrics))
+
+                    if saving_heads:
+                        if total_trained_steps % nb_steps_heads_saving == 0:
+                            self.save_heads(total_trained_steps)
+                    if saving_intermediary_models:
+                        if total_trained_steps % nb_steps_model_saving == 0:
+                            self.save_intermediary_model(total_trained_steps)
+
+    
+    
+    
+    
     def save_intermediary_model(self, n_steps):
         fname = os.path.join(self.args.output_dir, f"model-{n_steps}")
         self.save_model(output_dir=fname)
